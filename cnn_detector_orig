@@ -1,0 +1,161 @@
+function [confs,row_dets,col_dets,im_scale]=cnn_detector(im,range);
+
+im_copy=im;
+im_scale=range/2500;
+im=gpuArray(imresize(im,im_scale,'bilinear'));
+[d1,d2]=size(im);
+
+imrow=d1; imcol=d2;
+
+
+load trained_cnn
+
+
+nL=2;
+L1wts=net.Layers(nL).Weights; B1=net.Layers(nL).Bias;
+B1tm=net.Layers(nL+1).TrainedMean;B1tv=net.Layers(nL+1).TrainedVariance;B1off=net.Layers(nL+1).Offset;B1s=net.Layers(nL+1).Scale;
+nL=5;
+L2wts=net.Layers(nL).Weights; B2=net.Layers(nL).Bias;
+B2tm=net.Layers(nL+1).TrainedMean;B2tv=net.Layers(nL+1).TrainedVariance;B2off=net.Layers(nL+1).Offset;B2s=net.Layers(nL+1).Scale;
+nL=8;
+L3wts=net.Layers(nL).Weights; B3=net.Layers(nL).Bias;
+B3tm=net.Layers(nL+1).TrainedMean;B3tv=net.Layers(nL+1).TrainedVariance;B3off=net.Layers(nL+1).Offset;B3s=net.Layers(nL+1).Scale;
+nL=11;
+L4wts=net.Layers(nL).Weights; B4=net.Layers(nL).Bias;
+
+% tic
+
+
+% Layer 1
+Y=convlayer(im,L1wts,B1);
+Y=batchnorm(Y,B1tm,B1tv,B1off,B1s);
+mask=Y>0;
+Lout=mask.*Y+0.1*(1-mask).*Y;
+
+% Layer 2
+Y=convlayer(Lout,L2wts,B2);
+Y=batchnorm(Y,B2tm,B2tv,B2off,B2s);
+mask=Y>0;
+Lout=mask.*Y+0.1*(1-mask).*Y;
+
+% Layer 3
+Y=convlayer(Lout,L3wts,B3);
+Y=batchnorm(Y,B3tm,B3tv,B3off,B3s);
+mask=Y>0;
+Lout=mask.*Y+0.01*(1-mask).*Y;
+
+% Layer 4
+Y=convlayer(Lout,L4wts,B4);
+% mask=Y>0;
+% Lout=mask.*Y+0.01*(1-mask).*Y;
+
+% Layer 5
+% Y=convlayer(Lout,L5wts,B5);
+% toc
+
+Y=Y.^2;
+% figure (3); imagesc(Y); colormap gray; colorbar; 
+Y=padgpu(Y,imrow,imcol);
+Nfind=30; %for 32 full correlations
+[row_dets,col_dets,confs]=fastPdet2(Y,Nfind);
+
+
+N=length(confs);
+confs=confs';
+
+if N>5
+    tconfs=confs(6:N);
+else
+    tconfs=confs;
+end
+
+Aah=std(confs)*sqrt(6)/pi;
+cent=mean(confs)-Aah*0.577216649;
+confs=(confs-cent)/Aah;
+
+row_dets=row_dets'/im_scale;
+col_dets=col_dets'/im_scale;
+im_scale=1;
+
+% figure(2); imagesc(im_copy); axis('image');colormap gray
+
+confs=confs(1:min(N,10));
+row_dets=row_dets(1:min(N,10));
+col_dets=col_dets(1:min(N,10));
+
+% for i=1:min(N,10)
+%     text(col_dets(i),row_dets(i),num2str(i), 'color','w');
+% end
+
+function Y=batchnorm(X,Btm,Btv,Boff,Bs);
+
+N=size(Btm,3);
+Y=X;
+for i=1:N
+    x=Y(:,:,i);
+    x=(x-Btm(i))/sqrt(1e-5+Btv(i));
+    Y(:,:,i)=x*Bs(i)+Boff(i);
+end
+
+function Y=convlayer(im,L1wts,B1)
+
+d1=size(im,1); d2=size(im,2);
+f1=size(L1wts,1); f2=size(L1wts,2);
+Nfilts=size(L1wts,4);
+Nstack=size(L1wts,3);
+
+
+% Y=single(zeros(d1-f1+1, d2-f2+1,Nfilts));
+Y=gpuArray(single(zeros(d1-f1+1, d2-f2+1,Nfilts)));
+
+
+% parfor i=1:Nfilts
+for i=1:Nfilts
+
+%     tmp=single(zeros(d1-f1+1,d2-f2+1));
+        tmp=gpuArray(single(zeros(d1-f1+1,d2-f2+1)));
+
+
+   for j=1:Nstack
+        h=L1wts(:,:,j,i);
+        tmp=tmp+filter2(h,im(:,:,j),'valid');
+    end
+    Y(:,:,i)=tmp+B1(1,1,i);
+end
+
+function y=padgpu(x,d1,d2);
+
+y=gpuArray(zeros(d1,d2));
+% y=zeros(d1,d2);
+
+
+[m,n]=size(x);
+
+o1=d1/2+1;
+o2=d2/2+1;
+
+r1=round(o1-m/2);
+r2=round(r1+m-1);
+
+c1= round(o2-n/2);
+c2=round(c1+n-1);
+
+y(r1:r2,c1:c2)=x;
+
+function [R,C,psr1]=fastPdet2(g1, Ndet);
+
+[M,N]=size(g1);
+R=[]; C=[]; psr1=[];
+ming=min(g1(:));
+for i=1:Ndet
+   [p,col]=max(max(g1));
+   [p,row]=max(g1(:,col));
+   R=[R;row]; C=[C;col];
+   r1=max(row-10,1); r2=min(r1+19,M); r1=r2-19;
+   c1=max(col-20,1); c2=min(c1+39,N); c1=c2-39;
+   psr1=[psr1;p];
+   g1(r1:r2,c1:c2)=ones(20,40)*ming;
+end
+disp (' ');
+
+
